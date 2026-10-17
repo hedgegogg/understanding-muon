@@ -3,6 +3,7 @@
 import argparse
 import csv
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import time
 
@@ -238,10 +239,57 @@ def train(name, data):
     return row
 
 
+def plot_losses(week):
+    os.environ.setdefault("MPLCONFIGDIR", str(LOCAL / "matplotlib"))
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    with (LOCAL / "results.csv").open(newline="") as handle:
+        results = {row["optimizer"]: row for row in csv.DictReader(handle)
+                   if int(row["week"]) == week}
+    with (LOCAL / "curves.csv").open(newline="") as handle:
+        curves = list(csv.DictReader(handle))
+    labels = {"adamw": "AdamW", "lion": "Lion", "muon": "Muon + AdamW"}
+    figure, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+    for name, label in labels.items():
+        result = results.get(name)
+        if result is None or result["status"] != "completed":
+            raise ValueError(f"A completed {name} run is required for the loss plot.")
+        rows = sorted((row for row in curves if row["started_at_utc"] == result["started_at_utc"]
+                       and row["optimizer"] == name and int(row["week"]) == week),
+                      key=lambda row: int(row["epoch"]))
+        epochs = [int(row["epoch"]) for row in rows]
+        if epochs != list(range(int(result["epochs_planned"]) + 1)):
+            raise ValueError(f"The {name} loss curve has missing or duplicate epochs.")
+        for axis, partition in zip(axes, ["train", "validation"]):
+            losses = [float(row[f"{partition}_loss"]) for row in rows]
+            if not np.isfinite(losses).all() or not np.isclose(losses[-1], float(result[f"final_{partition}_loss"])):
+                raise ValueError(f"The {name} {partition} curve does not match the saved result.")
+            axis.plot(epochs, losses, marker="o", label=label)
+    for axis, title in zip(axes, ["Training loss", "Validation loss"]):
+        axis.set(title=title, xlabel="Epoch")
+        axis.set_xticks(epochs)
+        axis.grid(alpha=0.25)
+        axis.legend()
+    axes[0].set_ylabel("Cross-entropy loss")
+    figure.suptitle(f"Week {week}: digits, seed 11, provisional learning rates")
+    figure.tight_layout()
+    output = LOCAL.parent / "results" / f"week{week}" / "losses.png"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=160)
+    plt.close(figure)
+    print(f"Saved loss plot: {output.relative_to(LOCAL.parent)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--week", type=int, choices=[1], required=True)
-    parser.parse_args()
+    parser.add_argument("--plot-only", action="store_true", help="Plot saved losses without training.")
+    args = parser.parse_args()
+    if args.plot_only:
+        plot_losses(args.week)
+        return
     torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True)
     data = load_data()
@@ -260,6 +308,7 @@ def main():
         if time.perf_counter() - started >= 1800:
             raise RuntimeError("Compute budget reached. Completed runs are saved; comparison is incomplete.")
     print("Saved three new runs in .local/results.csv and epoch metrics in .local/curves.csv.")
+    plot_losses(args.week)
 
 
 if __name__ == "__main__":
