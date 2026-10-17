@@ -218,3 +218,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local instructions and computation output
+/AGENTS.md
+/PROJECT_PLAN.md
+/.local/
+/notes/
+
+# Local material from the earlier starter package
+/PROMPTS.md
+/SOURCES.md
+/WEEKLY_STATUS.csv
+/templates/
