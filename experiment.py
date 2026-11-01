@@ -23,6 +23,7 @@ WEEK_2 = {"seeds": [11, 22, 33], "epochs": 8,
           "learning_rates": {"adamw": [1e-4, 1e-3, 1e-2],
                              "lion": [3e-5, 3e-4, 3e-3],
                              "muon": [1e-3, 1e-2, 1e-1]}}
+WEEK_3 = {"seeds": [11, 22, 33], "epochs": 15}
 # Week 2: lowest mean validation loss after eight epochs across seeds 11, 22, 33.
 SELECTED_LRS = {"adamw": 1e-2, "lion": 3e-3, "muon": 1e-2, "auxiliary_adamw": 1e-2}
 
@@ -226,7 +227,7 @@ def train(name, data, week, seed, lr, epochs, lr_aux=1e-3):
         status, reason = "interrupted", "KeyboardInterrupt"
     runtime = time.perf_counter() - started
     row = {"started_at_utc": started_at, "week": week,
-           "condition": "initial_runs" if week == 1 else "lr_sweep",
+           "condition": {1: "initial_runs", 2: "lr_sweep", 3: "baseline"}[week],
            "optimizer": name, "seed": seed, "lr": lr,
            "lr_aux": lr_aux if name == "muon" else "",
            "epochs_planned": epochs, "steps": step, "examples_seen": examples_seen,
@@ -295,6 +296,36 @@ def calibrate(data):
     return selected
 
 
+def baseline(data):
+    with (LOCAL / "results.csv").open(newline="") as handle:
+        pilots = [row for row in csv.DictReader(handle)
+                  if int(row["week"]) == 2 and row["status"] == "completed"]
+    if not pilots:
+        raise RuntimeError("Complete week 2 before running the frozen-rate baseline.")
+    for name in WEEK_2["learning_rates"]:
+        eligible = [candidate for candidate in candidate_summaries(pilots, name)
+                    if candidate["mean"] is not None]
+        if not eligible or min(eligible, key=lambda row: (row["mean"], row["lr"]))["lr"] != SELECTED_LRS[name]:
+            raise ValueError(f"Frozen {name} rate does not match the completed calibration.")
+    if SELECTED_LRS["auxiliary_adamw"] != SELECTED_LRS["adamw"]:
+        raise ValueError("Auxiliary AdamW must use the selected ordinary AdamW rate.")
+    estimate = 9 * WEEK_3["epochs"] * max(float(row["runtime_seconds"]) / int(row["epochs_planned"])
+                                        for row in pilots) * 10
+    print(f"Week 3: 9 new runs, 2160 updates; measured-pilot estimate {estimate:.3f} seconds with a 10x allowance.", flush=True)
+    if estimate > 1800:
+        raise RuntimeError("Estimated baseline exceeds the 30-minute budget. Review before running.")
+    started = time.perf_counter()
+    rows = []
+    for name in WEEK_2["learning_rates"]:
+        for seed in WEEK_3["seeds"]:
+            if time.perf_counter() - started >= 1800:
+                raise RuntimeError("Compute budget reached between runs. Baseline is incomplete.")
+            rows.append(train(name, data, 3, seed, SELECTED_LRS[name],
+                              WEEK_3["epochs"], SELECTED_LRS["auxiliary_adamw"]))
+    print(f"Saved {len(rows)} baseline runs; {sum(row['status'] == 'completed' for row in rows)}/9 completed.", flush=True)
+    return rows
+
+
 def plot_learning_rates():
     os.environ.setdefault("MPLCONFIGDIR", str(LOCAL / "matplotlib"))
     import matplotlib
@@ -346,34 +377,46 @@ def plot_losses(week):
     import matplotlib.pyplot as plt
 
     with (LOCAL / "results.csv").open(newline="") as handle:
-        results = {row["optimizer"]: row for row in csv.DictReader(handle)
+        results = {(row["optimizer"], int(row["seed"])): row for row in csv.DictReader(handle)
                    if int(row["week"]) == week}
     with (LOCAL / "curves.csv").open(newline="") as handle:
         curves = list(csv.DictReader(handle))
     labels = {"adamw": "AdamW", "lion": "Lion", "muon": "Muon + AdamW"}
+    seeds = [WEEK_1["seed"]] if week == 1 else WEEK_3["seeds"]
+    planned_epochs = WEEK_1["epochs"] if week == 1 else WEEK_3["epochs"]
+    epochs = list(range(planned_epochs + 1))
     figure, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
     for name, label in labels.items():
-        result = results.get(name)
-        if result is None or result["status"] != "completed":
-            raise ValueError(f"A completed {name} run is required for the loss plot.")
-        rows = sorted((row for row in curves if row["started_at_utc"] == result["started_at_utc"]
-                       and row["optimizer"] == name and int(row["week"]) == week),
-                      key=lambda row: int(row["epoch"]))
-        epochs = [int(row["epoch"]) for row in rows]
-        if epochs != list(range(int(result["epochs_planned"]) + 1)):
-            raise ValueError(f"The {name} loss curve has missing or duplicate epochs.")
+        seed_curves = []
+        for seed in seeds:
+            result = results.get((name, seed))
+            if result is None or result["status"] != "completed" or int(result["epochs_planned"]) != planned_epochs:
+                raise ValueError(f"A completed {name} run at seed {seed} is required for the loss plot.")
+            rows = sorted((row for row in curves if row["started_at_utc"] == result["started_at_utc"]
+                           and row["optimizer"] == name and int(row["week"]) == week),
+                          key=lambda row: int(row["epoch"]))
+            if [int(row["epoch"]) for row in rows] != epochs:
+                raise ValueError(f"The {name} seed-{seed} loss curve has missing or duplicate epochs.")
+            for partition in ["train", "validation"]:
+                losses = [float(row[f"{partition}_loss"]) for row in rows]
+                if not np.isfinite(losses).all() or not np.isclose(losses[-1], float(result[f"final_{partition}_loss"])):
+                    raise ValueError(f"The {name} {partition} curve does not match the saved result.")
+            seed_curves.append(rows)
         for axis, partition in zip(axes, ["train", "validation"]):
-            losses = [float(row[f"{partition}_loss"]) for row in rows]
-            if not np.isfinite(losses).all() or not np.isclose(losses[-1], float(result[f"final_{partition}_loss"])):
-                raise ValueError(f"The {name} {partition} curve does not match the saved result.")
-            axis.plot(epochs, losses, marker="o", label=label)
+            losses = np.array([[float(row[f"{partition}_loss"]) for row in rows] for rows in seed_curves])
+            mean = losses.mean(axis=0)
+            line, = axis.plot(epochs, mean, marker="o", label=label)
+            if len(seeds) > 1:
+                sd = losses.std(axis=0, ddof=1)
+                axis.fill_between(epochs, mean - sd, mean + sd, color=line.get_color(), alpha=0.18)
     for axis, title in zip(axes, ["Training loss", "Validation loss"]):
         axis.set(title=title, xlabel="Epoch")
         axis.set_xticks(epochs)
         axis.grid(alpha=0.25)
         axis.legend()
     axes[0].set_ylabel("Cross-entropy loss")
-    figure.suptitle(f"Week {week}: digits, seed 11, provisional learning rates")
+    title = "seed 11, provisional learning rates" if week == 1 else "frozen rates, mean ± sample SD (3 seeds)"
+    figure.suptitle(f"Week {week}: digits, {title}")
     figure.tight_layout()
     output = LOCAL.parent / "results" / f"week{week}" / "losses.png"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -384,11 +427,11 @@ def plot_losses(week):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--week", type=int, choices=[1, 2], required=True)
+    parser.add_argument("--week", type=int, choices=[1, 2, 3], required=True)
     parser.add_argument("--plot-only", action="store_true", help="Plot saved results without training.")
     args = parser.parse_args()
     if args.plot_only:
-        plot_losses(1) if args.week == 1 else plot_learning_rates()
+        plot_learning_rates() if args.week == 2 else plot_losses(args.week)
         return
     torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True)
@@ -396,6 +439,13 @@ def main():
     if args.week == 2:
         calibrate(data)
         plot_learning_rates()
+        return
+    if args.week == 3:
+        rows = baseline(data)
+        if all(row["status"] == "completed" for row in rows):
+            plot_losses(3)
+        else:
+            print("Some baseline runs diverged. Inspect the saved statuses before summarizing.")
         return
     print("Week 1: three five-epoch CPU runs, seed 11, 80 steps each. Test remains unused.", flush=True)
     started = time.perf_counter()
