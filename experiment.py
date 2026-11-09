@@ -3,6 +3,7 @@
 import argparse
 import csv
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import time
@@ -24,6 +25,8 @@ WEEK_2 = {"seeds": [11, 22, 33], "epochs": 8,
                              "lion": [3e-5, 3e-4, 3e-3],
                              "muon": [1e-3, 1e-2, 1e-1]}}
 WEEK_3 = {"seeds": [11, 22, 33], "epochs": 15}
+WEEK_4 = {"seeds": [11, 22, 33],
+          "cases": {"square": (8, 8), "rank2": (8, 8), "rectangular": (16, 8)}}
 # Week 2: lowest mean validation loss after eight epochs across seeds 11, 22, 33.
 SELECTED_LRS = {"adamw": 1e-2, "lion": 3e-3, "muon": 1e-2, "auxiliary_adamw": 1e-2}
 
@@ -326,6 +329,130 @@ def baseline(data):
     return rows
 
 
+def matrix_probes():
+    LOCAL.mkdir(exist_ok=True)
+    cases, inputs = [], {}
+    for seed in WEEK_4["seeds"]:
+        generator = torch.Generator().manual_seed(seed)
+        for case, shape in WEEK_4["cases"].items():
+            u = torch.linalg.qr(torch.randn(*shape, generator=generator), mode="reduced").Q
+            v = torch.linalg.qr(torch.randn(8, 8, generator=generator), mode="reduced").Q
+            singular = torch.tensor([1.0, 0.1, 0, 0, 0, 0, 0, 0]) if case == "rank2" else torch.logspace(0, -3, 8)
+            gradient = (u * singular) @ v.mT
+            weights = torch.randn(*shape, generator=generator)
+            torch.testing.assert_close(u.mT @ u, torch.eye(8), atol=1e-6, rtol=1e-5)
+            torch.testing.assert_close(v.mT @ v, torch.eye(8), atol=1e-6, rtol=1e-5)
+            torch.testing.assert_close(torch.linalg.svdvals(gradient.double()), singular.double(), atol=1e-6, rtol=1e-4)
+            cases.append((case, seed, gradient, weights))
+            inputs[f"{case}_{seed}_gradient"] = gradient.numpy()
+            inputs[f"{case}_{seed}_weights"] = weights.numpy()
+    input_path = LOCAL / "matrix_inputs.npz"
+    if input_path.exists():
+        with np.load(input_path) as saved:
+            if set(saved.files) != set(inputs) or any(not np.array_equal(saved[key], value) for key, value in inputs.items()):
+                raise ValueError("Saved matrix inputs differ. Preserve the earlier inputs before retrying.")
+    else:
+        np.savez(input_path, **inputs)
+    print("Week 4: nine matrices, 27 fresh-state updates, lr=1, decay=0; no auxiliary optimizer or network training.", flush=True)
+    study_started = time.perf_counter()
+    completed = 0
+    probe_seconds = 0.0
+    for case, seed, gradient, weights in cases:
+        u, singular, vh = torch.linalg.svd(gradient.double(), full_matrices=False)
+        # The polar diagnostic gives zero response below the relative rank threshold.
+        keep = singular > 1e-7 * singular.max()
+        polar = u[:, keep] @ vh[keep]
+        for name in ["adamw", "lion", "muon"]:
+            if time.perf_counter() - study_started >= 1800:
+                raise RuntimeError("Matrix-probe budget reached. Completed probes are saved.")
+            started_at = datetime.now(timezone.utc).isoformat()
+            started = time.perf_counter()
+            measured = {"update_spectrum": "[]", "update": "[]", "update_norm": "",
+                        "cosine_with_gradient": "", "polar_cosine": ""}
+            status, reason = "completed", ""
+            try:
+                parameter = nn.Parameter(weights.clone())
+                if name == "adamw":
+                    optimizer = torch.optim.AdamW([parameter], lr=1, betas=(0.9, 0.999), eps=1e-8, weight_decay=0)
+                elif name == "lion":
+                    optimizer = Lion([parameter], lr=1)
+                else:
+                    optimizer = Muon([parameter], lr=1)
+                assert not optimizer.state
+                assert torch.equal(parameter.detach(), weights)
+                parameter.grad = gradient.clone()
+                optimizer.step()
+                update = (weights - parameter.detach()) / 1.0
+                if not torch.isfinite(parameter).all() or not torch.isfinite(update).all():
+                    raise FloatingPointError("Non-finite matrix update.")
+                direction = update.double()
+                measured = {"update_spectrum": json.dumps(torch.linalg.svdvals(direction).tolist()),
+                            "update": json.dumps(update.tolist()), "update_norm": float(direction.norm()),
+                            "cosine_with_gradient": float(F.cosine_similarity(direction.flatten(), gradient.double().flatten(), dim=0)),
+                            "polar_cosine": float(F.cosine_similarity(direction.flatten(), polar.flatten(), dim=0)) if name == "muon" else ""}
+            except Exception as error:
+                status = "diverged" if isinstance(error, FloatingPointError) else "failed"
+                reason = f"{type(error).__name__}: {error}"
+            runtime = time.perf_counter() - started
+            append_csv("matrix_probes.csv", {"started_at_utc": started_at, "week": 4, "case": case,
+                       "seed": seed, "optimizer": name, "lr": 1, "weight_decay": 0,
+                       "rows": gradient.shape[0], "columns": gradient.shape[1],
+                       "gradient_spectrum": json.dumps(singular.tolist()),
+                       "gradient_norm": float(gradient.double().norm()), **measured,
+                       "runtime_seconds": runtime, "status": status, "reason": reason})
+            print(f"{case}, seed={seed}, {name}: {status}, norm={measured['update_norm']}, cosine={measured['cosine_with_gradient']}", flush=True)
+            if status != "completed":
+                raise RuntimeError(f"Probe saved as {status}: {reason}")
+            completed += 1
+            probe_seconds += runtime
+            if completed == 1:
+                estimate = 27 * runtime * 10
+                print(f"First planned probe: {runtime:.6f} seconds. Estimated 27-probe time with a 10x allowance: {estimate:.3f} seconds.", flush=True)
+                if estimate > 1800:
+                    raise RuntimeError("The measured matrix pilot exceeds the estimated budget. Review before continuing.")
+    print(f"Completed {completed}/27 probes; summed probe time {probe_seconds:.6f} seconds; study wall time {time.perf_counter() - study_started:.6f} seconds.", flush=True)
+
+
+def plot_matrix_spectra():
+    os.environ.setdefault("MPLCONFIGDIR", str(LOCAL / "matplotlib"))
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    with (LOCAL / "matrix_probes.csv").open(newline="") as handle:
+        latest = {(row["case"], int(row["seed"]), row["optimizer"]): row
+                  for row in csv.DictReader(handle) if int(row["week"]) == 4}
+    figure, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
+    titles = {"square": "Full rank, 8×8", "rank2": "Nominal rank 2, 8×8", "rectangular": "Full rank, 16×8"}
+    for axis, case in zip(axes, WEEK_4["cases"]):
+        for name, label, color in [("gradient", "Input gradient", "black"), ("adamw", "AdamW", "C0"),
+                                   ("lion", "Lion", "C1"), ("muon", "Muon", "C2")]:
+            spectra = []
+            for seed in WEEK_4["seeds"]:
+                row = latest.get((case, seed, "adamw" if name == "gradient" else name))
+                if row is None or row["status"] != "completed":
+                    raise ValueError(f"Missing completed {case}, seed-{seed}, {name} spectrum.")
+                values = np.array(json.loads(row["gradient_spectrum" if name == "gradient" else "update_spectrum"]))
+                if values.shape != (8,) or not np.isfinite(values).all() or values.max() <= 0:
+                    raise ValueError("Invalid saved singular values.")
+                spectra.append(values / values.max())
+            mean = np.mean(spectra, axis=0)
+            axis.semilogy(range(1, 9), np.maximum(mean, 1e-12), color=color,
+                          marker="o", linestyle="--" if name == "gradient" else "-", label=label)
+        axis.set(title=titles[case], xlabel="Singular-value index", xticks=range(1, 9))
+        axis.grid(alpha=0.25)
+    axes[0].set_ylabel("Singular value / maximum")
+    axes[0].legend(fontsize=8)
+    figure.suptitle("Week 4: mean normalized spectra across three seeds")
+    figure.text(0.5, 0.01, "Values below 1e-12 are shown at the display floor; tiny rank-2 residuals include float32 roundoff.", ha="center", fontsize=8)
+    figure.tight_layout(rect=(0, 0.04, 1, 1))
+    output = LOCAL.parent / "results/week4/spectra.png"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=160)
+    plt.close(figure)
+    print(f"Saved matrix spectrum plot: {output.relative_to(LOCAL.parent)}")
+
+
 def plot_learning_rates():
     os.environ.setdefault("MPLCONFIGDIR", str(LOCAL / "matplotlib"))
     import matplotlib
@@ -427,14 +554,23 @@ def plot_losses(week):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--week", type=int, choices=[1, 2, 3], required=True)
+    parser.add_argument("--week", type=int, choices=[1, 2, 3, 4], required=True)
     parser.add_argument("--plot-only", action="store_true", help="Plot saved results without training.")
     args = parser.parse_args()
     if args.plot_only:
-        plot_learning_rates() if args.week == 2 else plot_losses(args.week)
+        if args.week == 4:
+            plot_matrix_spectra()
+        elif args.week == 2:
+            plot_learning_rates()
+        else:
+            plot_losses(args.week)
         return
     torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True)
+    if args.week == 4:
+        matrix_probes()
+        plot_matrix_spectra()
+        return
     data = load_data()
     if args.week == 2:
         calibrate(data)

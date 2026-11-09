@@ -38,6 +38,14 @@ Run the week-3 baseline after calibration with:
 
 This runs nine new 15-epoch models with frozen rates. Repeating it appends nine new attempts. Use `--week 3 --plot-only` to rebuild its loss plot without training. The script checks the frozen rates against the local completed calibration before training.
 
+Run the week-4 matrix-update probes with:
+
+```bash
+.venv/bin/python experiment.py --week 4
+```
+
+This performs 27 fresh-state matrix updates without loading digits or training a network. It appends measurements, spectra, and measured updates to `.local/matrix_probes.csv`, with shared input matrices in `.local/matrix_inputs.npz`. Repeating it appends 27 new probes. Use `--week 4 --plot-only` to rebuild the spectrum plot without taking new optimizer steps.
+
 The planned model is a two-hidden-layer MLP with width 64. The dataset is scikit-learn's digits: 1797 images of size 8×8, split into 1000 training, 300 validation, and 497 test examples. Pixels are divided by 16. Most comparisons use three training seeds.
 
 AdamW and Lion update the full network. Muon updates the hidden weight matrices, with AdamW for the remaining parameters. Pion will use the same parameter grouping once the paper intended by the instructor is confirmed.
@@ -46,13 +54,14 @@ AdamW and Lion update the full network. Muon updates the hidden weight matrices,
 
 The sequence is: initial runs, learning-rate selection, repeated baseline, matrix updates, batch size at equal epochs, batch size at equal steps, incorrect labels, smaller training sets, weight decay, network width, Pion diagnostics, Pion training, Pion with incorrect labels, and a final repeat with new seeds.
 
-The shared script currently implements weeks 1, 2, and 3. Completed experiments:
+The shared script currently implements weeks 1 through 4. Completed experiments:
 
 | Week | Question | Visual result |
 |---|---|---|
 | 1 | Do the three recipes begin learning? | [Loss curves](results/week1/losses.png) |
 | 2 | How sensitive are the recipes to learning rate? | [Learning-rate plot](results/week2/learning_rates.png) |
 | 3 | Is the frozen-rate comparison consistent across seeds? | [Loss means and variability](results/week3/losses.png) |
+| 4 | How does an identical matrix gradient become an update? | [Update spectra](results/week4/spectra.png) |
 
 ## Results
 
@@ -110,6 +119,42 @@ These summaries use sample standard deviation across three seeds. Accuracy SD is
 Muon + AdamW had the lowest validation loss at every matching seed and exceeded AdamW's mean accuracy by 2.11 percentage points. AdamW and Lion both averaged 95.67% accuracy, despite different losses. Every baseline reproduced its corresponding week-2 validation loss at epoch 8; no new calibration runs were required.
 
 Measured run times totaled **3.212690 seconds**: 3.054124 training and 0.124059 evaluation seconds, plus overhead. Imports, data loading, checks, and plotting are excluded. The [loss plot](results/week3/losses.png) shows means and shaded sample standard deviations, not confidence intervals. These results describe frozen recipes on one small task. Three seeds, reused validation data, coarse eight-epoch calibration, and auxiliary AdamW limit broader conclusions. Test data remain untouched.
+
+### Week 4
+
+All 27 one-step probes completed with finite values: three matrix types × three seeds (11, 22, 33) × AdamW, Lion, and standalone Muon. The shared inputs were G=U diag(s) Vᵀ with orthonormal U,V from QR: 8×8 and 16×8 with s=logspace(0,-3,8), and 8×8 with nominal rank 2, s=(1,0.1,0,0,0,0,0,0). Optimizers shared G and random starting W within each case, used fresh states, lr=1, and zero decay. There was no auxiliary AdamW and no network training. Optimizer formulas stayed unchanged. Updates used CPU float32, one PyTorch thread; diagnostics used float64. D=(W_before−W_after)/lr.
+
+Frobenius norm measures overall update size. Cosine measures alignment between the flattened update and G, with 1 meaning the same direction. Each individual cell below gives **norm / cosine**.
+
+| Input | Seed | AdamW norm / cosine | Lion norm / cosine | Muon norm / cosine |
+|---|---:|---:|---:|---:|
+| Full-rank 8×8 | 11 | 7.999996 / 0.699908 | 8.000000 / 0.699908 | 2.310587 / 0.519173 |
+| Full-rank 8×8 | 22 | 7.999991 / 0.779754 | 8.000000 / 0.779753 | 2.310585 / 0.519173 |
+| Full-rank 8×8 | 33 | 7.999997 / 0.774039 | 8.000000 / 0.774039 | 2.310584 / 0.519173 |
+| Rank-2 8×8 | 11 | 7.999997 / 0.810891 | 8.000000 / 0.810891 | 0.997525 / 0.770953 |
+| Rank-2 8×8 | 22 | 7.999998 / 0.762928 | 8.000000 / 0.762928 | 0.997525 / 0.770953 |
+| Rank-2 8×8 | 33 | 7.999920 / 0.641119 | 8.000000 / 0.641113 | 0.997525 / 0.770953 |
+| Full-rank 16×8 | 11 | 11.313703 / 0.786301 | 11.313709 / 0.786301 | 3.267662 / 0.519173 |
+| Full-rank 16×8 | 22 | 11.313703 / 0.762123 | 11.313708 / 0.762123 | 3.267661 / 0.519173 |
+| Full-rank 16×8 | 33 | 11.313681 / 0.740100 | 11.313708 / 0.740098 | 3.267659 / 0.519173 |
+
+| Input | Optimizer | Update norm, mean ± sample SD | Gradient cosine, mean ± sample SD | Completed |
+|---|---|---:|---:|---:|
+| Full-rank 8×8 | AdamW | 7.999995 ± 3.6e-06 | 0.751234 ± 0.045 | 3/3 |
+| Full-rank 8×8 | Lion | 8.000000 ± 3.4e-08 | 0.751233 ± 0.045 | 3/3 |
+| Full-rank 8×8 | Muon | 2.310585 ± 1.8e-06 | 0.519173 ± 2.5e-07 | 3/3 |
+| Rank-2 8×8 | AdamW | 7.999972 ± 4.5e-05 | 0.738313 ± 0.088 | 3/3 |
+| Rank-2 8×8 | Lion | 8.000000 ± 5.4e-08 | 0.738311 ± 0.088 | 3/3 |
+| Rank-2 8×8 | Muon | 0.997525 ± 1.4e-07 | 0.770953 ± 1.6e-07 | 3/3 |
+| Full-rank 16×8 | AdamW | 11.313696 ± 1.2e-05 | 0.762841 ± 0.023 | 3/3 |
+| Full-rank 16×8 | Lion | 11.313708 ± 5.5e-08 | 0.762841 ± 0.023 | 3/3 |
+| Full-rank 16×8 | Muon | 3.267661 ± 1.4e-06 | 0.519173 ± 2e-07 | 3/3 |
+
+The [spectrum plot](results/week4/spectra.png) shows the mean of three spectra, each normalized by its own maximum. Full-rank input ratios were approximately 1000. Muon's update ratios were **2.474025 ± 0.000007** for square inputs and **2.474022 ± 0.000010** for rectangular inputs (mean ± sample SD). Raw update sizes remain in the tables, since normalization hides scale. Values below 1e-12 are shown at the plot floor; tiny residuals in nominal rank-2 inputs and updates include floating-point effects.
+
+AdamW and Lion produced nearly identical first updates: relative differences were at most 7.52e-5. Fresh-state AdamW approximates an elementwise sign update subject to epsilon, so this does not show that the full optimizers are equivalent. Muon's cosine with the SVD polar reference ranged from 0.972609 to 0.999989; that reference uses zero response for singular values below 1e-7 of G's maximum. Five Newton-Schulz steps need not equal the exact polar factor. Muon transforms updates, not weights into orthogonal matrices. These synthetic probes do not establish classification performance or identify weak directions as noise.
+
+The summed recorded probe blocks took **0.031219 seconds**; the study loop including logging took **0.049427 seconds**. Imports, shared input generation, and plotting are excluded. The first planned probe took 0.007334 seconds, giving a conservative 1.980-second estimate with a 10× allowance. No digit data were loaded, and no later experiments ran.
 
 ## References
 
