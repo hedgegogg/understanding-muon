@@ -28,6 +28,7 @@ WEEK_3 = {"seeds": [11, 22, 33], "epochs": 15}
 WEEK_4 = {"seeds": [11, 22, 33],
           "cases": {"square": (8, 8), "rank2": (8, 8), "rectangular": (16, 8)}}
 WEEK_5 = {"seeds": [11, 22, 33], "epochs": 15, "batch_sizes": [32, 256]}
+WEEK_6 = {"seeds": [11, 22, 33], "steps": 240, "batch_sizes": [32, 256]}
 # Week 2: lowest mean validation loss after eight epochs across seeds 11, 22, 33.
 SELECTED_LRS = {"adamw": 1e-2, "lion": 3e-3, "muon": 1e-2, "auxiliary_adamw": 1e-2}
 
@@ -177,7 +178,7 @@ def append_csv(filename, row):
         writer.writerow(row)
 
 
-def train(name, data, week, seed, lr, epochs, lr_aux=1e-3, batch_size=64):
+def train(name, data, week, seed, lr, epochs, lr_aux=1e-3, batch_size=64, max_steps=None):
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
     model = make_model(seed)
@@ -221,9 +222,15 @@ def train(name, data, week, seed, lr, epochs, lr_aux=1e-3, batch_size=64):
                     examples_seen += len(y)
                     if not all(torch.isfinite(p).all() for p in model.parameters()):
                         raise FloatingPointError("Non-finite parameter after update.")
+                    if max_steps is not None and step >= max_steps:
+                        break
             finally:
                 train_seconds += time.perf_counter() - before
             final = measure(epoch)
+            if max_steps is not None and step >= max_steps:
+                break
+        if max_steps is not None and step != max_steps:
+            raise ValueError("The epoch limit did not allow the requested update count.")
     except Exception as error:
         status = "diverged" if isinstance(error, FloatingPointError) else "failed"
         reason = f"{type(error).__name__}: {error}"
@@ -231,7 +238,7 @@ def train(name, data, week, seed, lr, epochs, lr_aux=1e-3, batch_size=64):
         status, reason = "interrupted", "KeyboardInterrupt"
     runtime = time.perf_counter() - started
     row = {"started_at_utc": started_at, "week": week,
-           "condition": f"batch_{batch_size}" if week == 5 else {1: "initial_runs", 2: "lr_sweep", 3: "baseline"}[week],
+           "condition": f"batch_{batch_size}" if week in {5, 6} else {1: "initial_runs", 2: "lr_sweep", 3: "baseline"}[week],
            "optimizer": name, "seed": seed, "lr": lr,
            "lr_aux": lr_aux if name == "muon" else "",
            "epochs_planned": epochs, "steps": step, "examples_seen": examples_seen,
@@ -330,16 +337,17 @@ def baseline(data):
     return rows
 
 
-def batch_size_results():
+def batch_size_results(week=5):
+    settings = WEEK_5 if week == 5 else WEEK_6
     results = {}
     with (LOCAL / "results.csv").open(newline="") as handle:
         for row in csv.DictReader(handle):
             if int(row["week"]) == 3 and row["condition"] == "baseline":
                 size = 64
-            elif int(row["week"]) == 5:
-                sizes = {f"batch_{size}": size for size in WEEK_5["batch_sizes"]}
+            elif int(row["week"]) == week:
+                sizes = {f"batch_{size}": size for size in settings["batch_sizes"]}
                 if row["condition"] not in sizes:
-                    raise ValueError("Unknown saved week-5 batch condition.")
+                    raise ValueError(f"Unknown saved week-{week} batch condition.")
                 size = sizes[row["condition"]]
             else:
                 continue
@@ -347,11 +355,12 @@ def batch_size_results():
     return results
 
 
-def batch_sizes(data):
-    saved = batch_size_results()
+def batch_sizes(data, week=5):
+    settings = WEEK_5 if week == 5 else WEEK_6
+    saved = batch_size_results(week)
     controls = []
     for name in WEEK_2["learning_rates"]:
-        for seed in WEEK_5["seeds"]:
+        for seed in settings["seeds"]:
             row = saved.get((name, 64, seed))
             if (row is None or row["status"] != "completed" or int(row["epochs_planned"]) != 15
                     or int(row["steps"]) != 240 or int(row["examples_seen"]) != 15000
@@ -360,65 +369,79 @@ def batch_sizes(data):
                 raise ValueError(f"A matching week-3 control is required for {name}, seed {seed}.")
             controls.append(row)
     n = len(data["train"][1])
-    steps = sum(((n + size - 1) // size) * WEEK_5["epochs"] for size in WEEK_5["batch_sizes"]) * 9
+    steps = (sum(((n + size - 1) // size) * settings["epochs"] for size in settings["batch_sizes"])
+             if week == 5 else len(settings["batch_sizes"]) * settings["steps"]) * 9
     estimate = steps * max(float(row["runtime_seconds"]) / int(row["steps"]) for row in controls) * 10
-    print(f"Week 5: 18 new runs, {steps} updates, nine reused batch-64 controls; conservative estimate {estimate:.3f} seconds.", flush=True)
+    print(f"Week {week}: 18 new runs, {steps} updates, nine reused batch-64 controls; conservative estimate {estimate:.3f} seconds.", flush=True)
     if estimate > 1800:
         raise RuntimeError("The batch-size estimate exceeds the 30-minute budget. Review before continuing.")
     started = time.perf_counter()
     rows = []
-    for seed in WEEK_5["seeds"]:
-        for size in WEEK_5["batch_sizes"]:
+    for seed in settings["seeds"]:
+        for size in settings["batch_sizes"]:
+            steps_per_epoch = (n + size - 1) // size
+            max_steps = settings.get("steps")
+            epochs = settings["epochs"] if week == 5 else (max_steps + steps_per_epoch - 1) // steps_per_epoch
             for name in WEEK_2["learning_rates"]:
                 if time.perf_counter() - started >= 1800:
                     raise RuntimeError("Batch-size budget reached between runs. Completed runs are saved.")
-                rows.append(train(name, data, 5, seed, SELECTED_LRS[name], WEEK_5["epochs"],
-                                  SELECTED_LRS["auxiliary_adamw"], batch_size=size))
+                rows.append(train(name, data, week, seed, SELECTED_LRS[name], epochs,
+                                  SELECTED_LRS["auxiliary_adamw"], batch_size=size, max_steps=max_steps))
     print(f"Saved {len(rows)} new runs; {sum(row['status'] == 'completed' for row in rows)}/18 completed.", flush=True)
     return rows
 
 
-def plot_batch_sizes():
+def plot_batch_sizes(week=5):
+    settings = WEEK_5 if week == 5 else WEEK_6
     os.environ.setdefault("MPLCONFIGDIR", str(LOCAL / "matplotlib"))
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    results = batch_size_results()
+    results = batch_size_results(week)
     with (LOCAL / "curves.csv").open(newline="") as handle:
         curves = list(csv.DictReader(handle))
     figure, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
     labels = {"adamw": "AdamW", "lion": "Lion", "muon": "Muon + AdamW"}
-    epochs = list(range(WEEK_5["epochs"] + 1))
     for axis, name in zip(axes, labels):
         for size in [32, 64, 256]:
-            losses = []
-            for seed in WEEK_5["seeds"]:
+            losses, seed_steps = [], []
+            for seed in settings["seeds"]:
                 result = results.get((name, size, seed))
-                if result is None or result["status"] != "completed" or int(result["examples_seen"]) != 15000:
+                if (result is None or result["status"] != "completed"
+                        or (week == 5 and int(result["examples_seen"]) != 15000)
+                        or (week == 6 and int(result["steps"]) != WEEK_6["steps"])):
                     raise ValueError(f"Missing completed {name}, batch-{size}, seed-{seed} run.")
                 measured = sorted((row for row in curves if row["started_at_utc"] == result["started_at_utc"]),
                                   key=lambda row: int(row["epoch"]))
+                epochs = list(range(int(result["epochs_planned"]) + 1))
                 if [int(row["epoch"]) for row in measured] != epochs:
                     raise ValueError("The batch-size curve has missing or duplicate epochs.")
                 values = [float(row["validation_loss"]) for row in measured]
                 if not np.isfinite(values).all() or not np.isclose(values[-1], float(result["final_validation_loss"])):
                     raise ValueError("The batch-size curve does not match its saved result.")
                 losses.append(values)
-            # Every completed epoch sees all 1000 examples, including the short last batch.
-            examples = np.array(epochs) * (int(result["examples_seen"]) // int(result["epochs_planned"]))
+                seed_steps.append([int(row["step"]) for row in measured])
+            if any(steps != seed_steps[0] for steps in seed_steps):
+                raise ValueError("Seeds have different evaluation steps.")
+            # Equal-epoch runs use exposure; fixed-step runs can stop during an epoch.
+            x = (np.array(epochs) * (int(result["examples_seen"]) // int(result["epochs_planned"]))
+                 if week == 5 else np.array(seed_steps[0]))
             mean = np.mean(losses, axis=0)
             sd = np.std(losses, axis=0, ddof=1)
             reference = ", week-3 control" if size == 64 else ""
-            line, = axis.plot(examples, mean, label=f"Batch {size}: {result['steps']} updates{reference}")
-            axis.fill_between(examples, mean - sd, mean + sd, color=line.get_color(), alpha=0.16)
-        axis.set(title=labels[name], xlabel="Examples seen (including repeats)", xticks=[0, 5000, 10000, 15000])
+            budget = f"{result['steps']} updates" if week == 5 else f"{int(result['examples_seen']):,} examples"
+            line, = axis.plot(x, mean, label=f"Batch {size}: {budget}{reference}")
+            axis.fill_between(x, mean - sd, mean + sd, color=line.get_color(), alpha=0.16)
+        axis.set(title=labels[name], xlabel="Examples seen (including repeats)" if week == 5 else "Optimizer updates",
+                 xticks=[0, 5000, 10000, 15000] if week == 5 else [0, 60, 120, 180, 240])
         axis.grid(alpha=0.25)
     axes[0].set_ylabel("Validation cross-entropy loss")
     axes[0].legend(fontsize=7)
-    figure.suptitle("Week 5: equal epochs, frozen rates (mean ± sample SD, three seeds)")
+    budget = "equal epochs" if week == 5 else "240 updates per run"
+    figure.suptitle(f"Week {week}: {budget}, frozen rates (mean ± sample SD, three seeds)")
     figure.tight_layout()
-    output = LOCAL.parent / "results/week5/batch_sizes.png"
+    output = LOCAL.parent / "results" / f"week{week}" / "batch_sizes.png"
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=160)
     plt.close(figure)
@@ -650,12 +673,12 @@ def plot_losses(week):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--week", type=int, choices=[1, 2, 3, 4, 5], required=True)
+    parser.add_argument("--week", type=int, choices=[1, 2, 3, 4, 5, 6], required=True)
     parser.add_argument("--plot-only", action="store_true", help="Plot saved results without training.")
     args = parser.parse_args()
     if args.plot_only:
-        if args.week == 5:
-            plot_batch_sizes()
+        if args.week in {5, 6}:
+            plot_batch_sizes(args.week)
         elif args.week == 4:
             plot_matrix_spectra()
         elif args.week == 2:
@@ -670,10 +693,10 @@ def main():
         plot_matrix_spectra()
         return
     data = load_data()
-    if args.week == 5:
-        rows = batch_sizes(data)
+    if args.week in {5, 6}:
+        rows = batch_sizes(data, args.week)
         if all(row["status"] == "completed" for row in rows):
-            plot_batch_sizes()
+            plot_batch_sizes(args.week)
         else:
             print("Some batch-size runs diverged. Inspect the saved statuses before summarizing.")
         return

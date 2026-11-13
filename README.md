@@ -54,6 +54,14 @@ Run the week-5 batch-size comparison after the baseline with:
 
 This runs 18 new 15-epoch models at batches 32 and 256, using all three recipes and seeds 11, 22, and 33. It reuses nine matching batch-64 controls from the local week-3 results. Conditions are recorded as `batch_32` and `batch_256` in the existing local CSV; no old logs are rewritten. Repeating the command appends 18 new attempts. Use `--week 5 --plot-only` to regenerate the comparison plot without training.
 
+Run the week-6 fixed-step comparison after the baseline with:
+
+```bash
+.venv/bin/python experiment.py --week 6
+```
+
+This runs 18 new models at batches 32 and 256, each for exactly 240 updates, and reuses the nine week-3 batch-64 controls. Shuffled epochs cycle as needed; the final partial epoch stops at the update limit. Repeating the command appends 18 new attempts. Use `--week 6 --plot-only` to rebuild the plot without training. The report and short post are saved locally in ignored `notes/week_06.md`.
+
 The planned model is a two-hidden-layer MLP with width 64. The dataset is scikit-learn's digits: 1797 images of size 8×8, split into 1000 training, 300 validation, and 497 test examples. Pixels are divided by 16. Most comparisons use three training seeds.
 
 AdamW and Lion update the full network. Muon updates the hidden weight matrices, with AdamW for the remaining parameters. Pion will use the same parameter grouping once the paper intended by the instructor is confirmed.
@@ -62,7 +70,7 @@ AdamW and Lion update the full network. Muon updates the hidden weight matrices,
 
 The sequence is: initial runs, learning-rate selection, repeated baseline, matrix updates, batch size at equal epochs, batch size at equal steps, incorrect labels, smaller training sets, weight decay, network width, Pion diagnostics, Pion training, Pion with incorrect labels, and a final repeat with new seeds.
 
-The shared script currently implements weeks 1 through 5. Completed experiments:
+The shared script currently implements weeks 1 through 6. Completed experiments:
 
 | Week | Question | Visual result |
 |---|---|---|
@@ -71,6 +79,7 @@ The shared script currently implements weeks 1 through 5. Completed experiments:
 | 3 | Is the frozen-rate comparison consistent across seeds? | [Loss means and variability](results/week3/losses.png) |
 | 4 | How does an identical matrix gradient become an update? | [Update spectra](results/week4/spectra.png) |
 | 5 | How does batch size affect frozen recipes at equal epochs? | [Batch-size comparison](results/week5/batch_sizes.png) |
+| 6 | Does the batch-size effect persist at exactly 240 updates? | [Loss versus updates](results/week6/batch_sizes.png) |
 
 ## Results
 
@@ -202,6 +211,52 @@ Muon + AdamW's mean validation loss increased from 0.089692 ± 0.000991 at batch
 The 18 new runs used **4860 updates** and took **8.022648 seconds** in recorded run time: 7.691823 training and 0.251090 evaluation seconds, plus overhead. Imports, data loading, verification, and plotting are excluded. The [plot](results/week5/batch_sizes.png) shows validation loss versus examples seen, with means and shaded sample standard deviations. Every epoch covers all 1000 examples; its endpoint therefore adds exactly 1000 examples to the exposure axis.
 
 These are fixed-rate recipe comparisons, not per-batch tuning results. Equal epochs change the number of optimizer updates, so the observations cannot be attributed solely to gradient noise. Three seeds, one task, and reused validation data limit broader conclusions. No test evaluation or week-6 fixed-step experiment was performed.
+
+### Week 6
+
+All 18 planned new runs completed with finite values, using batches 32 and 256, three recipes, and seeds 11, 22, and 33. Nine matching batch-64 controls were reused from week 3. The model, split, package versions, optimizer formulas, initial weights, and shuffled example order matched the earlier experiments. Learning rates remained AdamW 0.01, Lion 0.003, Muon 0.01, and auxiliary AdamW 0.01, with zero decay and no schedule. The test set remains untouched.
+
+Every run took **exactly 240 updates**. Shuffled full epochs were cycled, retaining the short last batches. Batch 32 saw **7512 examples**, including repeats: seven full epochs plus 16 batches of the eighth. Batch 64 saw **15,000 examples** in 15 epochs, and batch 256 saw **60,000** in 60 epochs. The local CSV's `epochs_planned` is the loop ceiling, 8 or 60; it does not imply eight complete epochs for batch 32.
+
+| Recipe | Batch | Seed 11: loss / accuracy | Seed 22: loss / accuracy | Seed 33: loss / accuracy | Source |
+|---|---:|---:|---:|---:|---|
+| AdamW | 32 | 0.170869 / 94.33% | 0.133161 / 96.67% | 0.234719 / 93.67% | Week 6, new |
+| AdamW | 64 | 0.193060 / 96.00% | 0.141453 / 95.67% | 0.182907 / 95.33% | Week 3 control |
+| AdamW | 256 | 0.190292 / 96.00% | 0.186109 / 96.00% | 0.186932 / 96.67% | Week 6, new |
+| Lion | 32 | 0.460783 / 91.00% | 0.362419 / 94.00% | 0.352418 / 93.67% | Week 6, new |
+| Lion | 64 | 0.632281 / 96.00% | 0.690329 / 96.00% | 0.654237 / 95.00% | Week 3 control |
+| Lion | 256 | 1.744788 / 96.00% | 1.925357 / 95.33% | 2.081773 / 95.00% | Week 6, new |
+| Muon + AdamW | 32 | 0.085611 / 97.00% | 0.087337 / 97.67% | 0.077839 / 98.33% | Week 6, new |
+| Muon + AdamW | 64 | 0.090213 / 98.00% | 0.090313 / 97.67% | 0.088549 / 97.67% | Week 3 control |
+| Muon + AdamW | 256 | 0.116523 / 97.67% | 0.157360 / 97.00% | 0.111862 / 97.67% | Week 6, new |
+
+| Recipe | Batch | Loss, mean ± sample SD | Accuracy mean (%) | Accuracy SD (pp) | Paired loss change vs 64, mean ± SD |
+|---|---:|---:|---:|---:|---:|
+| AdamW | 32 | 0.179583 ± 0.051336 | 94.89 | 1.58 | +0.007110 ± 0.039332 |
+| AdamW | 64 | 0.172473 ± 0.027340 | 95.67 | 0.33 | reference |
+| AdamW | 256 | 0.187778 ± 0.002216 | 96.22 | 0.38 | +0.015304 ± 0.025646 |
+| Lion | 32 | 0.391873 ± 0.059887 | 92.89 | 1.64 | -0.267076 ± 0.083795 |
+| Lion | 64 | 0.658949 ± 0.029310 | 95.67 | 0.58 | reference |
+| Lion | 256 | 1.917306 ± 0.168637 | 95.44 | 0.51 | +1.258357 ± 0.158805 |
+| Muon + AdamW | 32 | 0.083596 ± 0.005060 | 97.67 | 0.67 | -0.006096 ± 0.004078 |
+| Muon + AdamW | 64 | 0.089692 ± 0.000991 | 97.78 | 0.19 | reference |
+| Muon + AdamW | 256 | 0.128582 ± 0.025031 | 97.44 | 0.38 | +0.038890 ± 0.024431 |
+
+Summaries use mean and sample standard deviation across three seeds. Accuracy SD is in percentage points (pp). Paired loss changes subtract the batch-64 value at the same seed; negative means lower loss. All conditions completed 3/3, with no failures. Controls were not retrained or counted in the new computation totals.
+
+The key comparison with week 5 is batch 256, where the update budget increased from 60 to 240:
+
+| Recipe, batch 256 | Week 5: 60 updates, loss / accuracy | Week 6: 240 updates, loss / accuracy |
+|---|---:|---:|
+| AdamW | 0.176034 / 95.67% | 0.187778 / 96.22% |
+| Lion | 0.269877 / 91.78% | 1.917306 / 95.44% |
+| Muon + AdamW | 0.372210 / 92.22% | 0.128582 / 97.44% |
+
+Muon + AdamW recovered much of its previous large-batch loss increase. Its batch-256 loss fell at every seed compared with week 5, though it remained above the batch-64 control at every seed. Lion's batch-256 loss instead increased at every seed, while mean accuracy improved from 91.78% to 95.44%. The [curves](results/week6/batch_sizes.png) show Lion's validation loss rising during continued training. This is compatible with a confidence effect, but prediction confidence was not measured. AdamW's paired loss changes versus batch 64 had mixed signs across seeds.
+
+The 18 new runs used **4320 updates** and took **8.803455 recorded seconds**: 8.197491 training and 0.469025 evaluation seconds, plus overhead. Batch-32 runs totaled 2.959503 seconds and batch-256 runs 5.843951 seconds. Imports, data loading, checks, and plotting are excluded. The conservative estimate from the measured baseline was 81.738 seconds, below the 1800-second budget. All overlapping week-5/week-6 curve points matched exactly, supporting the unchanged training behavior before each stopping point.
+
+Equal updates still mean different data exposure and runtime. These are frozen-rate comparisons on one small task, with three seeds and reused validation data. Neither gradient noise nor gradient spectra were measured, so this experiment does not identify a spectral cause. The plot uses recorded update counts, means, and shaded sample standard deviations, not confidence intervals. The complete local report, per-seed results, and short post are in ignored `notes/week_06.md`; raw measurements remain in ignored `.local/`. No later weeks ran.
 
 ## References
 
