@@ -29,6 +29,7 @@ WEEK_4 = {"seeds": [11, 22, 33],
           "cases": {"square": (8, 8), "rank2": (8, 8), "rectangular": (16, 8)}}
 WEEK_5 = {"seeds": [11, 22, 33], "epochs": 15, "batch_sizes": [32, 256]}
 WEEK_6 = {"seeds": [11, 22, 33], "steps": 240, "batch_sizes": [32, 256]}
+WEEK_7 = {"seeds": [11, 22, 33], "epochs": 15, "noise_levels": [20, 40]}
 # Week 2: lowest mean validation loss after eight epochs across seeds 11, 22, 33.
 SELECTED_LRS = {"adamw": 1e-2, "lion": 3e-3, "muon": 1e-2, "auxiliary_adamw": 1e-2}
 
@@ -178,7 +179,8 @@ def append_csv(filename, row):
         writer.writerow(row)
 
 
-def train(name, data, week, seed, lr, epochs, lr_aux=1e-3, batch_size=64, max_steps=None):
+def train(name, data, week, seed, lr, epochs, lr_aux=1e-3, batch_size=64, max_steps=None,
+          condition=None):
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
     model = make_model(seed)
@@ -237,8 +239,10 @@ def train(name, data, week, seed, lr, epochs, lr_aux=1e-3, batch_size=64, max_st
     except KeyboardInterrupt:
         status, reason = "interrupted", "KeyboardInterrupt"
     runtime = time.perf_counter() - started
+    if condition is None:
+        condition = f"batch_{batch_size}" if week in {5, 6} else {1: "initial_runs", 2: "lr_sweep", 3: "baseline"}[week]
     row = {"started_at_utc": started_at, "week": week,
-           "condition": f"batch_{batch_size}" if week in {5, 6} else {1: "initial_runs", 2: "lr_sweep", 3: "baseline"}[week],
+           "condition": condition,
            "optimizer": name, "seed": seed, "lr": lr,
            "lr_aux": lr_aux if name == "muon" else "",
            "epochs_planned": epochs, "steps": step, "examples_seen": examples_seen,
@@ -446,6 +450,114 @@ def plot_batch_sizes(week=5):
     figure.savefig(output, dpi=160)
     plt.close(figure)
     print(f"Saved batch-size plot: {output.relative_to(LOCAL.parent)}")
+
+
+def corrupted_data(data, seed, percent):
+    if percent not in WEEK_7["noise_levels"]:
+        raise ValueError("Use a planned label-corruption percentage.")
+    clean = data["train"][1].numpy()
+    rng = np.random.default_rng(seed + 1000)
+    indices = rng.permutation(len(clean))
+    pool = len(clean) * max(WEEK_7["noise_levels"]) // 100
+    # An offset in 1..9 modulo 10 selects uniformly among the nine incorrect classes.
+    replacements = (clean[indices[:pool]] + rng.integers(1, 10, size=pool)) % 10
+    count = len(clean) * percent // 100
+    labels = clean.copy()
+    labels[indices[:count]] = replacements[:count]
+    assert np.count_nonzero(labels != clean) == count
+    with np.load(LOCAL / "data.npz") as previous:
+        saved = {key: previous[key] for key in previous.files}
+    key = f"labels_{seed}_{percent}"
+    if key in saved:
+        if not np.array_equal(saved[key], labels):
+            raise ValueError("Saved corrupted labels differ. Preserve them before retrying.")
+    else:
+        saved[key] = labels
+        np.savez(LOCAL / "data.npz", **saved)
+    return {"train": (data["train"][0], torch.from_numpy(labels)),
+            "validation": data["validation"]}
+
+
+def label_noise_results():
+    results = {}
+    with (LOCAL / "results.csv").open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            if int(row["week"]) == 3 and row["condition"] == "baseline":
+                percent = 0
+            elif int(row["week"]) == 7:
+                conditions = {f"labels_{p}": p for p in WEEK_7["noise_levels"]}
+                if row["condition"] not in conditions:
+                    raise ValueError("Unknown saved week-7 label condition.")
+                percent = conditions[row["condition"]]
+            else:
+                continue
+            results[(row["optimizer"], percent, int(row["seed"]))] = row
+    return results
+
+
+def label_noise(data):
+    saved = label_noise_results()
+    controls = []
+    for name in WEEK_2["learning_rates"]:
+        for seed in WEEK_7["seeds"]:
+            row = saved.get((name, 0, seed))
+            if (row is None or row["status"] != "completed" or int(row["epochs_planned"]) != 15
+                    or int(row["steps"]) != 240 or int(row["examples_seen"]) != 15000
+                    or float(row["lr"]) != SELECTED_LRS[name]
+                    or (name == "muon" and float(row["lr_aux"]) != SELECTED_LRS["auxiliary_adamw"])):
+                raise ValueError(f"A matching clean week-3 control is required for {name}, seed {seed}.")
+            controls.append(row)
+    estimate = 18 * max(float(row["runtime_seconds"]) for row in controls) * 10
+    print(f"Week 7: 18 new runs, 4320 updates, nine reused clean controls; estimated {estimate:.3f} seconds with a 10x allowance.", flush=True)
+    if estimate > 1800:
+        raise RuntimeError("The label-noise estimate exceeds the 30-minute budget.")
+    started = time.perf_counter()
+    rows = []
+    for seed in WEEK_7["seeds"]:
+        for percent in WEEK_7["noise_levels"]:
+            noisy = corrupted_data(data, seed, percent)
+            print(f"Training-label corruption: {percent}%, seed {seed}; validation stays clean.", flush=True)
+            for name in WEEK_2["learning_rates"]:
+                if time.perf_counter() - started >= 1800:
+                    raise RuntimeError("Label-noise budget reached between runs. Completed runs are saved.")
+                rows.append(train(name, noisy, 7, seed, SELECTED_LRS[name], WEEK_7["epochs"],
+                                  SELECTED_LRS["auxiliary_adamw"], condition=f"labels_{percent}"))
+    print(f"Saved {len(rows)} new runs; {sum(row['status'] == 'completed' for row in rows)}/18 completed.", flush=True)
+    return rows
+
+
+def plot_label_noise():
+    os.environ.setdefault("MPLCONFIGDIR", str(LOCAL / "matplotlib"))
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    results = label_noise_results()
+    levels = [0] + WEEK_7["noise_levels"]
+    figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+    for name, label in [("adamw", "AdamW"), ("lion", "Lion"), ("muon", "Muon + AdamW")]:
+        groups = [[results.get((name, percent, seed)) for seed in WEEK_7["seeds"]] for percent in levels]
+        if any(row is None or row["status"] != "completed" or int(row["steps"]) != 240
+               or int(row["examples_seen"]) != 15000 for group in groups for row in group):
+            raise ValueError(f"Missing complete label-noise comparison for {name}.")
+        for axis, metric, scale in zip(axes, ["final_validation_loss", "final_validation_accuracy"], [1, 100]):
+            values = np.array([[float(row[metric]) * scale for row in group] for group in groups])
+            if not np.isfinite(values).all():
+                raise ValueError("Non-finite saved label-noise metric.")
+            axis.errorbar(levels, values.mean(axis=1), yerr=values.std(axis=1, ddof=1),
+                          marker="o", capsize=4, label=label)
+    for axis, ylabel in zip(axes, ["Clean validation cross-entropy loss", "Clean validation accuracy (%)"]):
+        axis.set(xlabel="Incorrect training labels (%)", ylabel=ylabel, xticks=levels)
+        axis.grid(alpha=0.25)
+        axis.legend()
+    figure.suptitle("Week 7: frozen rates, 15 epochs (mean ± sample SD, three seeds)")
+    figure.text(0.5, 0.01, "0%: reused week-3 controls. 20% and 40%: new week-7 runs.", ha="center", fontsize=8)
+    figure.tight_layout(rect=(0, 0.04, 1, 1))
+    output = LOCAL.parent / "results/week7/label_noise.png"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=160)
+    plt.close(figure)
+    print(f"Saved label-noise plot: {output.relative_to(LOCAL.parent)}")
 
 
 def matrix_probes():
@@ -673,11 +785,13 @@ def plot_losses(week):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--week", type=int, choices=[1, 2, 3, 4, 5, 6], required=True)
+    parser.add_argument("--week", type=int, choices=[1, 2, 3, 4, 5, 6, 7], required=True)
     parser.add_argument("--plot-only", action="store_true", help="Plot saved results without training.")
     args = parser.parse_args()
     if args.plot_only:
-        if args.week in {5, 6}:
+        if args.week == 7:
+            plot_label_noise()
+        elif args.week in {5, 6}:
             plot_batch_sizes(args.week)
         elif args.week == 4:
             plot_matrix_spectra()
@@ -693,6 +807,13 @@ def main():
         plot_matrix_spectra()
         return
     data = load_data()
+    if args.week == 7:
+        rows = label_noise(data)
+        if all(row["status"] == "completed" for row in rows):
+            plot_label_noise()
+        else:
+            print("Some label-noise runs diverged. Inspect the saved statuses before summarizing.")
+        return
     if args.week in {5, 6}:
         rows = batch_sizes(data, args.week)
         if all(row["status"] == "completed" for row in rows):

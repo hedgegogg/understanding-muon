@@ -62,6 +62,14 @@ Run the week-6 fixed-step comparison after the baseline with:
 
 This runs 18 new models at batches 32 and 256, each for exactly 240 updates, and reuses the nine week-3 batch-64 controls. Shuffled epochs cycle as needed; the final partial epoch stops at the update limit. Repeating the command appends 18 new attempts. Use `--week 6 --plot-only` to rebuild the plot without training. The report and short post are saved locally in ignored `notes/week_06.md`.
 
+Run the week-7 label-corruption experiment after the baseline with:
+
+```bash
+.venv/bin/python experiment.py --week 7
+```
+
+This runs 18 new 15-epoch models with 20% and 40% incorrect training labels, reusing nine clean week-3 controls. Repeating it appends 18 new attempts with the same corruption. Labels are saved in `.local/data.npz` alongside the fixed split. Use `--week 7 --plot-only` to rebuild the comparison plot without training. The report and short post stay in ignored `notes/week_07.md`.
+
 The planned model is a two-hidden-layer MLP with width 64. The dataset is scikit-learn's digits: 1797 images of size 8×8, split into 1000 training, 300 validation, and 497 test examples. Pixels are divided by 16. Most comparisons use three training seeds.
 
 AdamW and Lion update the full network. Muon updates the hidden weight matrices, with AdamW for the remaining parameters. Pion will use the same parameter grouping once the paper intended by the instructor is confirmed.
@@ -70,7 +78,7 @@ AdamW and Lion update the full network. Muon updates the hidden weight matrices,
 
 The sequence is: initial runs, learning-rate selection, repeated baseline, matrix updates, batch size at equal epochs, batch size at equal steps, incorrect labels, smaller training sets, weight decay, network width, Pion diagnostics, Pion training, Pion with incorrect labels, and a final repeat with new seeds.
 
-The shared script currently implements weeks 1 through 6. Completed experiments:
+The shared script currently implements weeks 1 through 7. Completed experiments:
 
 | Week | Question | Visual result |
 |---|---|---|
@@ -80,6 +88,7 @@ The shared script currently implements weeks 1 through 6. Completed experiments:
 | 4 | How does an identical matrix gradient become an update? | [Update spectra](results/week4/spectra.png) |
 | 5 | How does batch size affect frozen recipes at equal epochs? | [Batch-size comparison](results/week5/batch_sizes.png) |
 | 6 | Does the batch-size effect persist at exactly 240 updates? | [Loss versus updates](results/week6/batch_sizes.png) |
+| 7 | How do frozen recipes respond to incorrect training labels? | [Loss and accuracy under corruption](results/week7/label_noise.png) |
 
 ## Results
 
@@ -257,6 +266,44 @@ Muon + AdamW recovered much of its previous large-batch loss increase. Its batch
 The 18 new runs used **4320 updates** and took **8.803455 recorded seconds**: 8.197491 training and 0.469025 evaluation seconds, plus overhead. Batch-32 runs totaled 2.959503 seconds and batch-256 runs 5.843951 seconds. Imports, data loading, checks, and plotting are excluded. The conservative estimate from the measured baseline was 81.738 seconds, below the 1800-second budget. All overlapping week-5/week-6 curve points matched exactly, supporting the unchanged training behavior before each stopping point.
 
 Equal updates still mean different data exposure and runtime. These are frozen-rate comparisons on one small task, with three seeds and reused validation data. Neither gradient noise nor gradient spectra were measured, so this experiment does not identify a spectral cause. The plot uses recorded update counts, means, and shaded sample standard deviations, not confidence intervals. The complete local report, per-seed results, and short post are in ignored `notes/week_06.md`; raw measurements remain in ignored `.local/`. No later weeks ran.
+
+### Week 7
+
+All 18 planned new runs completed with finite values: three recipes × 20% and 40% incorrect training labels × seeds 11, 22, and 33. Nine clean controls were reused from week 3 without retraining, after checking unchanged optimizer, model, split, evaluation, and training-loop code and matching package versions. The model remained 64→64→64→10 on sklearn digits, with 1000 training and 300 validation examples. All new runs used 15 epochs, batch 64 with short final batches retained, 240 updates, and 15,000 examples seen. Learning rates stayed AdamW 0.01, Lion 0.003, Muon 0.01, auxiliary AdamW 0.01. CPU float32, one PyTorch thread, zero decay, and no schedule remained fixed.
+
+For each seed, a separate NumPy `default_rng(seed+1000)` permuted the 1000 training indices. Offsets sampled uniformly from 1..9, added to the true class modulo 10, selected an incorrect class for each of the first 400 indices. The 20% condition used the first 200 replacements; those same indices and replacements were retained inside the 40% condition. Each recipe at the same seed received identical labels, initialization, and shuffled order. The labels are saved in ignored `.local/data.npz` while preserving the existing split arrays. Validation stayed clean, and the test set remains untouched. Training loss and accuracy in the local CSV refer to corrupted labels.
+
+| Recipe | Incorrect labels | Seed 11: loss / accuracy | Seed 22: loss / accuracy | Seed 33: loss / accuracy | Source |
+|---|---:|---:|---:|---:|---|
+| AdamW | 0% | 0.193060 / 96.00% | 0.141453 / 95.67% | 0.182907 / 95.33% | Week 3 control |
+| AdamW | 20% | 0.465143 / 92.67% | 0.451740 / 93.00% | 0.417321 / 94.00% | Week 7, new |
+| AdamW | 40% | 0.768348 / 88.67% | 0.808203 / 81.33% | 0.761359 / 91.00% | Week 7, new |
+| Lion | 0% | 0.632281 / 96.00% | 0.690329 / 96.00% | 0.654237 / 95.00% | Week 3 control |
+| Lion | 20% | 0.365346 / 93.33% | 0.449211 / 91.00% | 0.434784 / 89.33% | Week 7, new |
+| Lion | 40% | 0.723442 / 86.00% | 0.753380 / 85.00% | 0.769002 / 86.00% | Week 7, new |
+| Muon + AdamW | 0% | 0.090213 / 98.00% | 0.090313 / 97.67% | 0.088549 / 97.67% | Week 3 control |
+| Muon + AdamW | 20% | 0.393706 / 93.67% | 0.440920 / 89.33% | 0.422814 / 90.33% | Week 7, new |
+| Muon + AdamW | 40% | 0.690886 / 87.00% | 0.776602 / 82.67% | 0.794054 / 84.33% | Week 7, new |
+
+| Recipe | Incorrect labels | Validation loss, mean ± sample SD | Accuracy mean (%) | Accuracy SD (pp) | Paired loss change vs clean, mean ± SD | Accuracy change vs clean (pp) |
+|---|---:|---:|---:|---:|---:|---:|
+| AdamW | 0% | 0.172473 ± 0.027340 | 95.67 | 0.33 | reference | reference |
+| AdamW | 20% | 0.444735 ± 0.024668 | 93.22 | 0.69 | +0.272261 ± 0.037937 | -2.44 |
+| AdamW | 40% | 0.779303 ± 0.025271 | 87.00 | 5.04 | +0.606830 ± 0.051917 | -8.67 |
+| Lion | 0% | 0.658949 ± 0.029310 | 95.67 | 0.58 | reference | reference |
+| Lion | 20% | 0.416447 ± 0.044839 | 91.22 | 2.01 | -0.242502 ± 0.023771 | -4.44 |
+| Lion | 40% | 0.748608 ± 0.023152 | 85.67 | 0.58 | +0.089659 ± 0.025890 | -10.00 |
+| Muon + AdamW | 0% | 0.089692 ± 0.000991 | 97.78 | 0.19 | reference | reference |
+| Muon + AdamW | 20% | 0.419147 ± 0.023820 | 91.11 | 2.27 | +0.329455 ± 0.023923 | -6.67 |
+| Muon + AdamW | 40% | 0.753847 ± 0.055220 | 84.67 | 2.19 | +0.664156 ± 0.055811 | -13.11 |
+
+Means and sample standard deviations use three seeds. Paired loss changes subtract the clean control at the same seed, so negative means lower clean validation loss. Accuracy changes and SD are in percentage points (pp). All conditions completed 3/3; there were no failures. Controls are historical results, excluded from the new runtime total.
+
+Accuracy decreased at every seed for every recipe at both corruption levels. At 40% corruption, mean accuracy was 87.00% for AdamW, 85.67% for Lion, and 84.67% for Muon + AdamW. Muon's clean-data accuracy lead did not persist on average. This does not establish a general robustness ranking: the rates were calibrated on clean data, and each seed changes both the corruption pattern and training randomness.
+
+Lion's 20% validation loss decreased at all three seeds, averaging 0.416447 versus its clean control's 0.658949, while accuracy fell by 4.44 percentage points. A smaller loss increase alone would therefore be misleading as a robustness measure. Changed confidence is one possible explanation, but confidence and gradient spectra were not measured. Incorrect labels can repeatedly direct updates toward the wrong class; the experiment does not establish which part of an optimizer caused the observed behavior. This tests random incorrect training labels, rather than input corruption, adversarial robustness, or RLVR.
+
+The 18 new runs used **4320 updates** and took **7.731997 recorded seconds**: 7.367768 training and 0.271465 evaluation seconds, plus overhead. Imports, data preparation, checks, and plotting are excluded. The conservative estimate from measured controls was 81.738 seconds, below the 1800-second budget. The [plot](results/week7/label_noise.png) shows clean validation loss and accuracy, with means and sample SD rather than confidence intervals. The report, full table, and short post remain in ignored `notes/week_07.md`; raw results remain in ignored `.local/`. No later weeks ran.
 
 ## References
 
